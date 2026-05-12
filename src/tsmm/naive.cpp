@@ -1,4 +1,4 @@
-#include "tsmm.hpp"
+#include "../tsmm.hpp"
 
 #include <cstring>
 
@@ -16,3 +16,4 @@ void tsmm_naive(int m, int n, int k,
     }
 }
 
+REGISTER_TSMM_IMPL("naive", tsmm_naive);

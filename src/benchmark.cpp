@@ -11,12 +11,14 @@
 #include <vector>
 
 #ifndef _WIN32
+#include <sys/stat.h>
 #include <unistd.h>
 #else
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif
 #include <malloc.h>
+#include <direct.h>
 #include <winsock2.h>
 #pragma comment(lib, "ws2_32.lib")
 #endif
@@ -34,16 +36,6 @@ static const Problem PROBLEMS[] = {
     {4, 64, 606841, "4x64x606841", false},
     {442, 193, 11, "442x193x11", false},
     {40, 1127228, 40, "40x1127228x40", false},
-};
-
-static ImplDesc IMPLS[] = {
-    {"reference", tsmm_reference, true},
-    {"naive", tsmm_naive, false},
-    {"openmp", tsmm_openmp, false},
-    {"blocked", tsmm_blocked, false},
-    {"avx512", tsmm_avx512, false},
-    {"avx512_omp", tsmm_avx512_omp, false},
-    {"opt", tsmm_opt, false},
 };
 
 struct BenchResult {
@@ -111,20 +103,76 @@ static const char* layout_name(Layout layout) {
     return layout == Layout::RowMajor ? "row-major" : "col-major";
 }
 
-static void write_json(const char* path,
+static const char* layout_short(Layout layout) {
+    return layout == Layout::RowMajor ? "row" : "col";
+}
+
+static void ensure_dir(const std::string& path) {
+    if (path.empty()) return;
+    std::string cur;
+    for (std::size_t i = 0; i < path.size(); ++i) {
+        const char ch = path[i];
+        cur.push_back(ch);
+        if (ch != '/' && ch != '\\') continue;
+        if (cur.size() <= 1 || (cur.size() == 3 && cur[1] == ':')) continue;
+#ifdef _WIN32
+        _mkdir(cur.c_str());
+#else
+        mkdir(cur.c_str(), 0755);
+#endif
+    }
+#ifdef _WIN32
+    _mkdir(path.c_str());
+#else
+    mkdir(path.c_str(), 0755);
+#endif
+}
+
+static std::string parent_dir(const std::string& path) {
+    const std::size_t pos = path.find_last_of("/\\");
+    return pos == std::string::npos ? std::string() : path.substr(0, pos);
+}
+
+static std::string auto_output_path(const std::string& out_dir, Layout layout, const char* timestamp_file) {
+    std::string dir = out_dir.empty() ? "web/results" : out_dir;
+    ensure_dir("web");
+    ensure_dir(dir);
+    return dir + "/results_" + layout_short(layout) + "_" + timestamp_file + ".json";
+}
+
+static std::string json_escape(const std::string& s) {
+    std::string out;
+    out.reserve(s.size() + 8);
+    for (char ch : s) {
+        switch (ch) {
+            case '\\': out += "\\\\"; break;
+            case '"': out += "\\\""; break;
+            case '\n': out += "\\n"; break;
+            case '\r': out += "\\r"; break;
+            case '\t': out += "\\t"; break;
+            default: out.push_back(ch); break;
+        }
+    }
+    return out;
+}
+
+static void write_json(const std::string& path,
                        const std::vector<BenchResult>& results,
                        const char* hostname,
                        int nthreads,
                        const char* timestamp,
+                       const char* output_path,
                        Layout layout) {
-    FILE* fp = std::fopen(path, "w");
+    ensure_dir(parent_dir(path));
+    FILE* fp = std::fopen(path.c_str(), "w");
     if (!fp) {
-        std::perror(path);
+        std::perror(path.c_str());
         return;
     }
 
     std::fprintf(fp, "{\n");
     std::fprintf(fp, "  \"timestamp\": \"%s\",\n", timestamp);
+    std::fprintf(fp, "  \"output_path\": \"%s\",\n", json_escape(output_path).c_str());
     std::fprintf(fp, "  \"hostname\": \"%s\",\n", hostname);
     std::fprintf(fp, "  \"n_threads\": %d,\n", nthreads);
     std::fprintf(fp, "  \"layout\": \"%s\",\n", layout_name(layout));
@@ -174,7 +222,7 @@ static void write_json(const char* path,
 
     std::fprintf(fp, "  \"geomean_speedup\": {\n");
     bool first_impl = true;
-    for (const ImplDesc& impl : IMPLS) {
+    for (const ImplDesc& impl : tsmm_impl_registry()) {
         if (impl.is_ref) continue;
         double logsum = 0.0;
         int count = 0;
@@ -195,11 +243,12 @@ static void write_json(const char* path,
 }
 
 static void usage(const char* argv0) {
-    std::printf("Usage: %s [--output PATH] [--required-only] [--all] [--layout row|col] [--warmup N] [--runs N] [--no-correctness]\n", argv0);
+    std::printf("Usage: %s [--output PATH] [--output-dir DIR] [--required-only] [--all] [--layout row|col] [--warmup N] [--runs N] [--no-correctness]\n", argv0);
 }
 
 int main(int argc, char** argv) {
-    const char* out_path = "web/results.json";
+    std::string out_path;
+    std::string out_dir = "web/results";
     bool required_only = false;
     bool skip_correctness = false;
     int warmup = 10;
@@ -209,6 +258,8 @@ int main(int argc, char** argv) {
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--output") == 0 && i + 1 < argc) {
             out_path = argv[++i];
+        } else if (std::strcmp(argv[i], "--output-dir") == 0 && i + 1 < argc) {
+            out_dir = argv[++i];
         } else if (std::strcmp(argv[i], "--required-only") == 0) {
             required_only = true;
         } else if (std::strcmp(argv[i], "--all") == 0) {
@@ -248,7 +299,20 @@ int main(int argc, char** argv) {
 
     const std::time_t tt = std::time(nullptr);
     char timestamp[64];
+    char timestamp_file[64];
     std::strftime(timestamp, sizeof(timestamp), "%Y-%m-%dT%H:%M:%S", std::localtime(&tt));
+    std::strftime(timestamp_file, sizeof(timestamp_file), "%Y%m%d_%H%M%S", std::localtime(&tt));
+
+    if (out_path.empty()) {
+        out_path = auto_output_path(out_dir, layout, timestamp_file);
+    } else {
+        ensure_dir(parent_dir(out_path));
+    }
+
+    std::sort(tsmm_impl_registry().begin(), tsmm_impl_registry().end(),
+              [](const ImplDesc& a, const ImplDesc& b) {
+                  return std::strcmp(a.name, b.name) < 0;
+              });
 
     std::printf("=== TSMM Benchmark ===\n");
     std::printf("Host: %s | Threads: %d | Layout: %s | AVX-512: %s | BLAS: %s\n",
@@ -267,6 +331,7 @@ int main(int argc, char** argv) {
 #endif
     );
     std::printf("Warmup: %d | Runs: %d\n\n", warmup, runs);
+    std::printf("Output: %s\n\n", out_path.c_str());
 
     std::srand(42);
     std::vector<BenchResult> all_results;
@@ -305,7 +370,7 @@ int main(int argc, char** argv) {
         std::printf("  %-12s %10.3f ms %10.2f GFLOPS speedup=1.000 OK\n", "reference", ref_ms, ref_gflops);
         all_results.push_back({"reference", p.name, p.m, p.n, p.k, p.required, ref_ms, ref_gflops, 1.0, true});
 
-        for (const ImplDesc& impl : IMPLS) {
+        for (const ImplDesc& impl : tsmm_impl_registry()) {
             if (impl.is_ref) continue;
             for (int w = 0; w < this_warmup; ++w) impl.fn(p.m, p.n, p.k, A, B, Ctmp, layout);
             const double t0 = now_sec();
@@ -323,12 +388,12 @@ int main(int argc, char** argv) {
         free_mat(B);
         free_mat(Cref);
         free_mat(Ctmp);
-        write_json(out_path, all_results, hostname, nthreads, timestamp, layout);
+        write_json(out_path, all_results, hostname, nthreads, timestamp, out_path.c_str(), layout);
         std::printf("\n");
     }
 
     std::printf("=== Geometric mean speedup (required problems) ===\n");
-    for (const ImplDesc& impl : IMPLS) {
+    for (const ImplDesc& impl : tsmm_impl_registry()) {
         if (impl.is_ref) continue;
         double logsum = 0.0;
         int count = 0;
@@ -340,6 +405,7 @@ int main(int argc, char** argv) {
         }
         if (count > 0) std::printf("  %-12s %.3fx\n", impl.name, std::exp(logsum / count));
     }
-    write_json(out_path, all_results, hostname, nthreads, timestamp, layout);
+    write_json(out_path, all_results, hostname, nthreads, timestamp, out_path.c_str(), layout);
+    std::printf("RESULT_JSON=%s\n", out_path.c_str());
     return 0;
 }

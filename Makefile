@@ -1,6 +1,7 @@
 BLAS ?= openblas
 CXX ?= g++
-TARGET = benchmark
+OBJDIR ?= obj
+TARGET = $(OBJDIR)/benchmark
 
 CXXFLAGS = -O3 -march=native -std=c++17 -ffast-math -fopenmp
 CXXFLAGS += -Wall -Wextra -Wno-unused-parameter
@@ -25,31 +26,40 @@ ifeq ($(AVX512),1)
   CXXFLAGS += -mavx512f -mavx512dq -mavx512bw -mavx512vl
 endif
 
-SRC = $(wildcard src/*.cpp)
+SRC = $(wildcard src/*.cpp) $(wildcard src/tsmm/*.cpp)
+OBJ = $(patsubst %.cpp,$(OBJDIR)/%.o,$(SRC))
+DEP = $(OBJ:.o=.d)
 
 .PHONY: all run run-required web clean help
 
 all: $(TARGET)
 
-$(TARGET): $(SRC) src/tsmm.hpp
-	$(CXX) $(CXXFLAGS) $(SRC) -o $@ $(LDFLAGS)
+$(TARGET): $(OBJ)
+	@mkdir -p $(dir $@)
+	$(CXX) $(OBJ) -o $@ $(LDFLAGS)
 	@echo "Built $(TARGET) [BLAS=$(BLAS)]"
 
+$(OBJDIR)/%.o: %.cpp src/tsmm.hpp
+	@mkdir -p $(dir $@)
+	$(CXX) $(CXXFLAGS) -MMD -MP -c $< -o $@
+
 run: $(TARGET)
-	@mkdir -p web
-	./$(TARGET) --output web/results.json --all
+	bash scripts/run_local.sh --all
 
 run-required: $(TARGET)
-	@mkdir -p web
-	./$(TARGET) --output web/results.json --required-only
+	bash scripts/run_local.sh --required-only
 
 web:
-	python3 web/server.py --port 8080 --results web/results.json
+	python3 web/server.py --port 8080 --results web/results
 
 clean:
-	rm -f $(TARGET) $(TARGET).exe web/results.json
+	rm -rf $(OBJDIR)
+	rm -f benchmark benchmark.exe benchmark_check.exe
+	rm -rf web/results web/gflops_*.csv web/gflops_*.json logs
 
 help:
 	@echo "Targets: all run run-required web clean"
-	@echo "Options: BLAS=mkl|openblas|none AVX512=1"
-	@echo "Benchmark args example: ./benchmark --required-only --layout row --warmup 10 --runs 20"
+	@echo "Options: BLAS=mkl|openblas|none AVX512=1 OBJDIR=obj"
+	@echo "Benchmark args example: ./obj/benchmark --required-only --layout row --warmup 10 --runs 20"
+
+-include $(DEP)

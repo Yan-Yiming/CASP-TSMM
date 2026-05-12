@@ -1,4 +1,4 @@
-#include "tsmm.hpp"
+#include "../tsmm.hpp"
 
 #include <algorithm>
 #include <cstdlib>
@@ -15,6 +15,11 @@
 
 static void tsmm_opt_row(int m, int n, int k,
                          const double* A, const double* B, double* C) {
+    if (m == 144 && n == 144 && k == 144) {
+        tsmm_avx512_omp(m, n, k, A, B, C, Layout::RowMajor);
+        return;
+    }
+
     static int IB = 0;
     static int JB = 0;
     static int LB = 0;
@@ -126,13 +131,54 @@ static void tsmm_opt_row(int m, int n, int k,
     }
 }
 
+static void tsmm_opt_col_dot(int m, int n, int k,
+                             const double* A, const double* B, double* C) {
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
+    for (int j = 0; j < n; ++j) {
+        const double* b = B + static_cast<std::size_t>(j) * k;
+        double* c = C + static_cast<std::size_t>(j) * m;
+        for (int i = 0; i < m; ++i) {
+            const double* a = A + static_cast<std::size_t>(i) * k;
+            double sum0 = 0.0;
+            double sum1 = 0.0;
+            double sum2 = 0.0;
+            double sum3 = 0.0;
+            int l = 0;
+            for (; l + 3 < k; l += 4) {
+                sum0 += a[l] * b[l];
+                sum1 += a[l + 1] * b[l + 1];
+                sum2 += a[l + 2] * b[l + 2];
+                sum3 += a[l + 3] * b[l + 3];
+            }
+            double sum = (sum0 + sum1) + (sum2 + sum3);
+            for (; l < k; ++l) {
+                sum += a[l] * b[l];
+            }
+            c[i] = sum;
+        }
+    }
+}
+
+static void tsmm_opt_col(int m, int n, int k,
+                         const double* A, const double* B, double* C) {
+    if (m <= 64 || (m <= 256 && n <= 1024)) {
+        tsmm_opt_col_dot(m, n, k, A, B, C);
+        return;
+    }
+
+    tsmm_blocked(m, n, k, A, B, C, Layout::ColMajor);
+}
+
 void tsmm_opt(int m, int n, int k,
               const double* A, const double* B, double* C,
               Layout layout) {
     if (layout == Layout::RowMajor) {
         tsmm_opt_row(m, n, k, A, B, C);
     } else {
-        tsmm_blocked(m, n, k, A, B, C, layout);
+        tsmm_opt_col(m, n, k, A, B, C);
     }
 }
 
+REGISTER_TSMM_IMPL("opt", tsmm_opt);

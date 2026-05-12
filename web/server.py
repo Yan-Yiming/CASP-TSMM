@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import argparse
+import glob
 import http.server
 import json
 import os
@@ -7,7 +8,7 @@ import socketserver
 import time
 
 WEB_DIR = os.path.dirname(os.path.abspath(__file__))
-DEFAULT_RESULTS = os.path.join(WEB_DIR, "results.json")
+DEFAULT_RESULTS = os.path.join(WEB_DIR, "results")
 
 
 class Handler(http.server.SimpleHTTPRequestHandler):
@@ -26,12 +27,13 @@ class Handler(http.server.SimpleHTTPRequestHandler):
             super().do_GET()
 
     def serve_results(self):
-        if not os.path.exists(self.results_path):
+        result_file = self.resolve_result_file()
+        if not result_file:
             self.send_json({"status": "waiting"})
             return
 
         try:
-            with open(self.results_path, "r", encoding="utf-8") as f:
+            with open(result_file, "r", encoding="utf-8") as f:
                 text = f.read()
             json.loads(text)
         except Exception as exc:
@@ -46,13 +48,29 @@ class Handler(http.server.SimpleHTTPRequestHandler):
         self.wfile.write(text.encode("utf-8"))
 
     def serve_status(self):
-        exists = os.path.exists(self.results_path)
-        mtime = os.path.getmtime(self.results_path) if exists else 0
+        result_file = self.resolve_result_file()
+        exists = bool(result_file)
+        mtime = os.path.getmtime(result_file) if result_file else 0
         self.send_json({
             "ready": exists,
+            "file": result_file,
             "mtime": mtime,
             "mtime_str": time.ctime(mtime) if exists else None,
         })
+
+    def resolve_result_file(self):
+        path = self.results_path
+        if os.path.isfile(path):
+            return path
+        if not os.path.isdir(path):
+            return None
+
+        files = glob.glob(os.path.join(path, "results_*.json"))
+        files += glob.glob(os.path.join(path, "*", "results_*.json"))
+        files = [f for f in files if os.path.isfile(f)]
+        if not files:
+            return None
+        return max(files, key=os.path.getmtime)
 
     def send_json(self, obj, code=200):
         body = json.dumps(obj).encode("utf-8")
@@ -80,7 +98,7 @@ def main():
     socketserver.TCPServer.allow_reuse_address = True
     with socketserver.TCPServer((args.host, args.port), Handler) as httpd:
         print(f"TSMM dashboard: http://localhost:{args.port}")
-        print(f"Results file: {Handler.results_path}")
+        print(f"Results path: {Handler.results_path}")
         httpd.serve_forever()
 
 

@@ -1,4 +1,4 @@
-#include "tsmm.hpp"
+#include "../tsmm.hpp"
 
 #include <cstring>
 
@@ -69,3 +69,5 @@ void tsmm_avx512_omp(int m, int n, int k,
     }
 }
 
+REGISTER_TSMM_IMPL("avx512", tsmm_avx512);
+REGISTER_TSMM_IMPL("avx512_omp", tsmm_avx512_omp);

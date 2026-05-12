@@ -1,4 +1,4 @@
-#include "tsmm.hpp"
+#include "../tsmm.hpp"
 
 #include <algorithm>
 #include <cstdlib>
@@ -40,3 +40,4 @@ void tsmm_blocked(int m, int n, int k,
     }
 }
 
+REGISTER_TSMM_IMPL("blocked", tsmm_blocked);

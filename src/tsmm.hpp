@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstddef>
+#include <vector>
 
 enum class Layout {
     RowMajor,
@@ -24,6 +25,17 @@ struct ImplDesc {
     TsmmKernel fn;
     bool is_ref;
 };
+
+std::vector<ImplDesc>& tsmm_impl_registry();
+
+struct TsmmImplRegistrar {
+    TsmmImplRegistrar(const char* name, TsmmKernel fn) {
+        tsmm_impl_registry().push_back({name, fn, false});
+    }
+};
+
+#define REGISTER_TSMM_IMPL(name_literal, fn_name) \
+    static TsmmImplRegistrar tsmm_registrar_##fn_name(name_literal, fn_name)
 
 inline std::size_t idx_a(Layout layout, int l, int i, int k, int m) {
     return layout == Layout::RowMajor
@@ -50,4 +62,3 @@ void tsmm_blocked(int m, int n, int k, const double* A, const double* B, double*
 void tsmm_avx512(int m, int n, int k, const double* A, const double* B, double* C, Layout layout);
 void tsmm_avx512_omp(int m, int n, int k, const double* A, const double* B, double* C, Layout layout);
 void tsmm_opt(int m, int n, int k, const double* A, const double* B, double* C, Layout layout);
-

@@ -1,11 +1,14 @@
 benchmark
 benchmark.exe
 benchmark_check.exe
+obj/
 *.o
 *.obj
 *.pdb
 *.ilk
 logs/
 web/results.json
+web/results/
+web/gflops_*.csv
+web/gflops_*.json
 __pycache__/
-

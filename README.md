@@ -9,7 +9,7 @@ C = A^T * B
 A: k x m, B: k x n, C: m x n, double precision
 ```
 
-Both row-major and column-major storage are supported by the benchmark. The optimized kernels focus on the row-major path used by the default run.
+Both row-major and column-major storage are supported by the benchmark. The local and Slurm runners execute both layouts for the four required tasks by default.
 
 ## Project Layout
 
@@ -18,14 +18,18 @@ CASP-TSMM/
 |-- src/
 |   |-- benchmark.cpp       # benchmark harness, timing, correctness, JSON output
 |   |-- tsmm.hpp            # shared kernel interface and layout helpers
+|   |-- tsmm_registry.cpp   # automatic kernel registry
 |   |-- reference.cpp       # MKL/OpenBLAS dgemm reference, or built-in fallback
-|   |-- naive.cpp           # serial baseline
-|   |-- openmp_kernel.cpp   # OpenMP parallel baseline
-|   |-- blocked.cpp         # cache-blocked OpenMP kernel
-|   |-- avx512.cpp          # AVX-512 kernels
-|   `-- opt.cpp             # combined AVX-512/OpenMP/blocking kernel
+|   `-- tsmm/
+|       |-- naive.cpp           # serial baseline
+|       |-- openmp_kernel.cpp   # OpenMP parallel baseline
+|       |-- blocked.cpp         # cache-blocked OpenMP kernel
+|       |-- avx512.cpp          # AVX-512 kernels
+|       `-- opt.cpp             # combined optimized kernel
 |-- scripts/
-|   |-- run_local.sh        # local benchmark and dashboard runner
+|   |-- collect_gflops.py   # collect all GFLOPS rows into CSV/JSON
+|   |-- run_local.sh        # local row/col benchmark and dashboard runner
+|   |-- run_local.ps1       # Windows/MSVC local row/col runner
 |   `-- submit_slurm.sh     # Slurm submission helper for the target cluster
 |-- web/
 |   |-- index.html          # live dashboard
@@ -33,7 +37,8 @@ CASP-TSMM/
 `-- Makefile
 ```
 
-Generated files such as `benchmark`, `benchmark.exe`, `web/results.json`, and `logs/` are not source files.
+Generated files such as `benchmark`, `benchmark.exe`, `web/results/`, and `logs/` are not source files.
+Build intermediates and executables are placed under `obj/`.
 
 ## Implementations
 
@@ -50,18 +55,23 @@ Generated files such as `benchmark`, `benchmark.exe`, `web/results.json`, and `l
 ## Build And Run
 
 ```bash
-# OpenBLAS, default
-make BLAS=openblas
-./benchmark --output web/results.json --required-only
+# One-key local run: required tasks, row-major and col-major
+bash scripts/run_local.sh --required-only
 
-# Intel MKL on the target cluster
-source /opt/intel/mkl/bin/mklvars.sh intel64
-make BLAS=mkl AVX512=1
-./benchmark --output web/results.json --required-only
+# Optional: all tasks, row-major and col-major
+bash scripts/run_local.sh --all
+```
 
-# No external BLAS, useful for smoke tests
+On this Windows workspace, use the PowerShell runner:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts/run_local.ps1
+```
+
+```bash
+# Manual smoke test. If --output is omitted, the file name includes layout and timestamp.
 make BLAS=none
-./benchmark --output web/results.json --required-only --warmup 1 --runs 1
+./obj/benchmark --required-only --layout row --warmup 1 --runs 1
 ```
 
 Benchmark options:
@@ -70,6 +80,8 @@ Benchmark options:
 --required-only       run only the four required problems
 --all                 run required and optional problems
 --layout row|col      choose row-major or column-major storage
+--output-dir DIR      write results_<layout>_<timestamp>.json into DIR
+--output PATH         explicit output path, bypassing timestamp naming
 --warmup N            warmup iterations, default 10
 --runs N              timed iterations, default 20
 --no-correctness      skip comparison with the reference result
@@ -90,17 +102,35 @@ Or run benchmark and dashboard together:
 bash scripts/run_local.sh --required-only
 ```
 
-The benchmark writes incremental updates to `web/results.json`, and the dashboard polls it every three seconds.
+Each run writes timestamped JSON files under `web/results/<run-id>/`, plus `gflops.csv` and `gflops_summary.json`. The dashboard reads the newest result file it can find.
+
+## Adding A Kernel
+
+Add a new `.cpp` file under `src/tsmm/`, implement a function matching `TsmmKernel`, then register it:
+
+```cpp
+#include "../tsmm.hpp"
+
+void tsmm_my_kernel(int m, int n, int k, const double* A, const double* B, double* C, Layout layout) {
+    // compute C = A^T * B
+}
+
+REGISTER_TSMM_IMPL("my_kernel", tsmm_my_kernel);
+```
+
+The Makefile compiles `src/tsmm/*.cpp`, and the benchmark discovers registered kernels automatically.
 
 ## Slurm Target Run
 
-The target CPU is Intel Xeon Platinum 9242 with 96 cores, 4 NUMA nodes, and AVX-512. The submission helper requests all 96 CPUs and binds execution across NUMA nodes `0-3` with interleaved memory placement:
+The target CPU is Intel Xeon Platinum 9242 with 96 cores, 4 NUMA nodes, and AVX-512. The submission helper requests all 96 CPUs and runs both row-major and col-major required tasks by default:
 
 ```bash
 bash scripts/submit_slurm.sh              # required problems
 bash scripts/submit_slurm.sh --all        # required + optional
 bash scripts/submit_slurm.sh --dry-run    # print the generated job script
 ```
+
+The job uses `numactl --cpunodebind=0-3 --interleave=all`, `OMP_PROC_BIND=spread`, and `OMP_PLACES=cores`. Because the benchmark initializes matrices serially, interleaving pages across all four NUMA nodes is the most robust placement without changing measurement code; it avoids putting all pages on one NUMA node before the 96 OpenMP threads start computing.
 
 Useful environment overrides:
 

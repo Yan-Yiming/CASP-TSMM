@@ -1,4 +1,4 @@
-#include "tsmm.hpp"
+#include "../tsmm.hpp"
 
 #include <cstring>
 
@@ -24,3 +24,4 @@ void tsmm_openmp(int m, int n, int k,
     }
 }
 
+REGISTER_TSMM_IMPL("openmp", tsmm_openmp);
