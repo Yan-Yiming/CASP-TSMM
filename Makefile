@@ -6,6 +6,7 @@ TARGET = $(OBJDIR)/benchmark
 CXXFLAGS = -O3 -march=native -std=c++17 -ffast-math -fopenmp
 CXXFLAGS += -Wall -Wextra -Wno-unused-parameter
 LDFLAGS = -fopenmp -lm -lpthread
+CXXLIBS ?= -lstdc++
 
 ifeq ($(BLAS),mkl)
   ifndef MKLROOT
@@ -30,13 +31,13 @@ SRC = $(wildcard src/*.cpp) $(wildcard src/tsmm/*.cpp)
 OBJ = $(patsubst %.cpp,$(OBJDIR)/%.o,$(SRC))
 DEP = $(OBJ:.o=.d)
 
-.PHONY: all run run-required web clean help
+.PHONY: all run run-required web clean clean-results help
 
 all: $(TARGET)
 
 $(TARGET): $(OBJ)
 	@mkdir -p $(dir $@)
-	$(CXX) $(OBJ) -o $@ $(LDFLAGS)
+	$(CXX) $(OBJ) -o $@ $(LDFLAGS) $(CXXLIBS)
 	@echo "Built $(TARGET) [BLAS=$(BLAS)]"
 
 $(OBJDIR)/%.o: %.cpp src/tsmm.hpp
@@ -55,11 +56,14 @@ web:
 clean:
 	rm -rf $(OBJDIR)
 	rm -f benchmark benchmark.exe benchmark_check.exe
-	rm -rf web/results web/gflops_*.csv web/gflops_*.json logs
+	rm -rf web/gflops_*.csv web/gflops_*.json
+
+clean-results:
+	rm -rf web/results logs
 
 help:
-	@echo "Targets: all run run-required web clean"
-	@echo "Options: BLAS=mkl|openblas|none AVX512=1 OBJDIR=obj"
+	@echo "Targets: all run run-required web clean clean-results"
+	@echo "Options: BLAS=mkl|openblas|none AVX512=1 OBJDIR=obj CXXLIBS=-lstdc++"
 	@echo "Benchmark args example: ./obj/benchmark --required-only --layout row --warmup 10 --runs 20"
 
 -include $(DEP)

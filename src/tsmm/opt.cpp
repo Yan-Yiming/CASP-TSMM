@@ -1,7 +1,6 @@
 #include "../tsmm.hpp"
 
 #include <algorithm>
-#include <cstdlib>
 #include <cstring>
 #include <vector>
 
@@ -13,245 +12,288 @@
 #include <immintrin.h>
 #endif
 
-static void opt_avx512_row_omp(int m, int n, int k,
-                               const double* A, const double* B, double* C) {
-    std::memset(C, 0, static_cast<std::size_t>(m) * n * sizeof(double));
+static inline void row_fma_segment(double* c, const double* b, double av, int len) {
+    int j = 0;
+#ifdef __AVX512F__
+    const __m512d avec = _mm512_set1_pd(av);
+    for (; j + 31 < len; j += 32) {
+        __m512d c0 = _mm512_loadu_pd(c + j);
+        __m512d c1 = _mm512_loadu_pd(c + j + 8);
+        __m512d c2 = _mm512_loadu_pd(c + j + 16);
+        __m512d c3 = _mm512_loadu_pd(c + j + 24);
+        c0 = _mm512_fmadd_pd(avec, _mm512_loadu_pd(b + j), c0);
+        c1 = _mm512_fmadd_pd(avec, _mm512_loadu_pd(b + j + 8), c1);
+        c2 = _mm512_fmadd_pd(avec, _mm512_loadu_pd(b + j + 16), c2);
+        c3 = _mm512_fmadd_pd(avec, _mm512_loadu_pd(b + j + 24), c3);
+        _mm512_storeu_pd(c + j, c0);
+        _mm512_storeu_pd(c + j + 8, c1);
+        _mm512_storeu_pd(c + j + 16, c2);
+        _mm512_storeu_pd(c + j + 24, c3);
+    }
+    for (; j + 7 < len; j += 8) {
+        __m512d cv = _mm512_loadu_pd(c + j);
+        cv = _mm512_fmadd_pd(avec, _mm512_loadu_pd(b + j), cv);
+        _mm512_storeu_pd(c + j, cv);
+    }
+#endif
+    for (; j < len; ++j) {
+        c[j] += av * b[j];
+    }
+}
+
+static void row_tiny_output_large_k(int m, int n, int k,
+                                    const double* A, const double* B, double* C) {
+    int nthreads = 1;
+#ifdef _OPENMP
+    nthreads = omp_get_max_threads();
+#endif
+    const int out_size = m * n;
+    std::vector<double> tmp(static_cast<std::size_t>(nthreads) * out_size, 0.0);
 
 #ifdef _OPENMP
-#pragma omp parallel for schedule(static)
-#endif
-    for (int i = 0; i < m; ++i) {
-        double* c = C + static_cast<std::size_t>(i) * n;
+#pragma omp parallel
+    {
+        const int tid = omp_get_thread_num();
+        double* ct = tmp.data() + static_cast<std::size_t>(tid) * out_size;
+#pragma omp for schedule(static)
         for (int l = 0; l < k; ++l) {
-            const double av_d = A[static_cast<std::size_t>(l) * m + i];
+            const double* a = A + static_cast<std::size_t>(l) * m;
             const double* b = B + static_cast<std::size_t>(l) * n;
-            int j = 0;
-#ifdef __AVX512F__
-            const __m512d av = _mm512_set1_pd(av_d);
-            for (; j + 31 < n; j += 32) {
-                __m512d c0 = _mm512_loadu_pd(c + j);
-                __m512d c1 = _mm512_loadu_pd(c + j + 8);
-                __m512d c2 = _mm512_loadu_pd(c + j + 16);
-                __m512d c3 = _mm512_loadu_pd(c + j + 24);
-                c0 = _mm512_fmadd_pd(av, _mm512_loadu_pd(b + j), c0);
-                c1 = _mm512_fmadd_pd(av, _mm512_loadu_pd(b + j + 8), c1);
-                c2 = _mm512_fmadd_pd(av, _mm512_loadu_pd(b + j + 16), c2);
-                c3 = _mm512_fmadd_pd(av, _mm512_loadu_pd(b + j + 24), c3);
-                _mm512_storeu_pd(c + j, c0);
-                _mm512_storeu_pd(c + j + 8, c1);
-                _mm512_storeu_pd(c + j + 16, c2);
-                _mm512_storeu_pd(c + j + 24, c3);
+            for (int i = 0; i < m; ++i) {
+                row_fma_segment(ct + static_cast<std::size_t>(i) * n, b, a[i], n);
             }
-            for (; j + 7 < n; j += 8) {
-                __m512d cv = _mm512_loadu_pd(c + j);
-                cv = _mm512_fmadd_pd(av, _mm512_loadu_pd(b + j), cv);
-                _mm512_storeu_pd(c + j, cv);
+        }
+    }
+#else
+    double* ct = tmp[0].data();
+    for (int l = 0; l < k; ++l) {
+        const double* a = A + static_cast<std::size_t>(l) * m;
+        const double* b = B + static_cast<std::size_t>(l) * n;
+        for (int i = 0; i < m; ++i) {
+            row_fma_segment(ct + static_cast<std::size_t>(i) * n, b, a[i], n);
+        }
+    }
+#endif
+
+    std::memset(C, 0, static_cast<std::size_t>(m) * n * sizeof(double));
+    for (int idx = 0; idx < out_size; ++idx) {
+        double sum = 0.0;
+        for (int t = 0; t < nthreads; ++t) {
+            sum += tmp[static_cast<std::size_t>(t) * out_size + idx];
+        }
+        C[idx] = sum;
+    }
+}
+
+static void row_tile_i8_j16(int m, int n, int k,
+                            const double* A, const double* B, double* C) {
+    constexpr int IB = 8;
+    constexpr int JB = 16;
+    const int nbi = (m + IB - 1) / IB;
+    const int nbj = (n + JB - 1) / JB;
+
+#ifdef _OPENMP
+#pragma omp parallel for collapse(2) schedule(static)
+#endif
+    for (int bi = 0; bi < nbi; ++bi) {
+        for (int bj = 0; bj < nbj; ++bj) {
+            const int i0 = bi * IB;
+            const int j0 = bj * JB;
+            const int ilen = std::min(IB, m - i0);
+            const int jlen = std::min(JB, n - j0);
+
+#ifdef __AVX512F__
+            if (jlen >= 8) {
+                __m512d acc0[IB];
+                __m512d acc1[IB];
+                for (int ii = 0; ii < ilen; ++ii) {
+                    acc0[ii] = _mm512_setzero_pd();
+                    acc1[ii] = _mm512_setzero_pd();
+                }
+
+                for (int l = 0; l < k; ++l) {
+                    const double* b = B + static_cast<std::size_t>(l) * n + j0;
+                    const double* a = A + static_cast<std::size_t>(l) * m + i0;
+                    const __m512d b0 = _mm512_loadu_pd(b);
+                    const __m512d b1 = (jlen >= 16) ? _mm512_loadu_pd(b + 8) : _mm512_setzero_pd();
+                    for (int ii = 0; ii < ilen; ++ii) {
+                        const __m512d av = _mm512_set1_pd(a[ii]);
+                        acc0[ii] = _mm512_fmadd_pd(av, b0, acc0[ii]);
+                        if (jlen >= 16) {
+                            acc1[ii] = _mm512_fmadd_pd(av, b1, acc1[ii]);
+                        }
+                    }
+                }
+
+                for (int ii = 0; ii < ilen; ++ii) {
+                    double* c = C + static_cast<std::size_t>(i0 + ii) * n + j0;
+                    _mm512_storeu_pd(c, acc0[ii]);
+                    if (jlen >= 16) {
+                        _mm512_storeu_pd(c + 8, acc1[ii]);
+                    } else {
+                        for (int jj = 8; jj < jlen; ++jj) {
+                            double sum = 0.0;
+                            for (int l = 0; l < k; ++l) {
+                                sum += A[static_cast<std::size_t>(l) * m + i0 + ii] *
+                                       B[static_cast<std::size_t>(l) * n + j0 + jj];
+                            }
+                            c[jj] = sum;
+                        }
+                    }
+                }
+                continue;
             }
 #endif
-            for (; j < n; ++j) {
-                c[j] += av_d * b[j];
+
+            for (int ii = 0; ii < ilen; ++ii) {
+                double* c = C + static_cast<std::size_t>(i0 + ii) * n + j0;
+                for (int jj = 0; jj < jlen; ++jj) {
+                    double sum = 0.0;
+                    for (int l = 0; l < k; ++l) {
+                        sum += A[static_cast<std::size_t>(l) * m + i0 + ii] *
+                               B[static_cast<std::size_t>(l) * n + j0 + jj];
+                    }
+                    c[jj] = sum;
+                }
             }
         }
     }
 }
 
-static void opt_blocked_col(int m, int n, int k,
-                            const double* A, const double* B, double* C) {
-    static int IB = 0;
-    static int JB = 0;
-    static int LB = 0;
-    if (IB == 0) {
-        IB = std::getenv("OPT_COL_IB") ? std::atoi(std::getenv("OPT_COL_IB")) : 64;
-        JB = std::getenv("OPT_COL_JB") ? std::atoi(std::getenv("OPT_COL_JB")) : 512;
-        LB = std::getenv("OPT_COL_LB") ? std::atoi(std::getenv("OPT_COL_LB")) : 32;
+static inline double hsum_vec(
+#ifdef __AVX512F__
+    __m512d v
+#else
+    double v
+#endif
+) {
+#ifdef __AVX512F__
+    return _mm512_reduce_add_pd(v);
+#else
+    return v;
+#endif
+}
+
+static inline double dot_contiguous(const double* a, const double* b, int k) {
+    int l = 0;
+#ifdef __AVX512F__
+    __m512d acc = _mm512_setzero_pd();
+    for (; l + 7 < k; l += 8) {
+        acc = _mm512_fmadd_pd(_mm512_loadu_pd(a + l), _mm512_loadu_pd(b + l), acc);
+    }
+    double sum = hsum_vec(acc);
+#else
+    double sum = 0.0;
+#endif
+    for (; l < k; ++l) {
+        sum += a[l] * b[l];
+    }
+    return sum;
+}
+
+static inline void col_i8_kernel(int ilen, int k,
+                                 const double* A, const double* b, double* c) {
+#ifdef __AVX512F__
+    __m512d acc[8];
+    for (int ii = 0; ii < ilen; ++ii) {
+        acc[ii] = _mm512_setzero_pd();
+    }
+    int l = 0;
+    for (; l + 7 < k; l += 8) {
+        const __m512d bv = _mm512_loadu_pd(b + l);
+        for (int ii = 0; ii < ilen; ++ii) {
+            const double* a = A + static_cast<std::size_t>(ii) * k + l;
+            acc[ii] = _mm512_fmadd_pd(_mm512_loadu_pd(a), bv, acc[ii]);
+        }
+    }
+    for (int ii = 0; ii < ilen; ++ii) {
+        const double* a = A + static_cast<std::size_t>(ii) * k;
+        double sum = hsum_vec(acc[ii]);
+        for (int lt = l; lt < k; ++lt) {
+            sum += a[lt] * b[lt];
+        }
+        c[ii] = sum;
+    }
+#else
+    double sum[8] = {};
+    for (int l = 0; l < k; ++l) {
+        const double bv = b[l];
+        for (int ii = 0; ii < ilen; ++ii) {
+            sum[ii] += A[static_cast<std::size_t>(ii) * k + l] * bv;
+        }
+    }
+    for (int ii = 0; ii < ilen; ++ii) {
+        c[ii] = sum[ii];
+    }
+#endif
+}
+
+static void col_dot_element_parallel(int m, int n, int k,
+                                     const double* A, const double* B, double* C) {
+#ifdef _OPENMP
+#pragma omp parallel for collapse(2) schedule(static)
+#endif
+    for (int j = 0; j < n; ++j) {
+        for (int i = 0; i < m; ++i) {
+            C[static_cast<std::size_t>(j) * m + i] =
+                dot_contiguous(A + static_cast<std::size_t>(i) * k,
+                               B + static_cast<std::size_t>(j) * k,
+                               k);
+        }
+    }
+}
+
+static void col_dot_i8_block(int m, int n, int k,
+                             const double* A, const double* B, double* C,
+                             bool collapse_i) {
+    constexpr int IB = 8;
+
+    if (collapse_i) {
+        const int nbi = (m + IB - 1) / IB;
+#ifdef _OPENMP
+#pragma omp parallel for collapse(2) schedule(static)
+#endif
+        for (int j = 0; j < n; ++j) {
+            for (int bi = 0; bi < nbi; ++bi) {
+                const int i0 = bi * IB;
+                const int ilen = std::min(IB, m - i0);
+                const double* b = B + static_cast<std::size_t>(j) * k;
+                double* c = C + static_cast<std::size_t>(j) * m + i0;
+                col_i8_kernel(ilen, k, A + static_cast<std::size_t>(i0) * k, b, c);
+            }
+        }
+        return;
     }
 
-    std::memset(C, 0, static_cast<std::size_t>(m) * n * sizeof(double));
-
 #ifdef _OPENMP
-#pragma omp parallel for schedule(dynamic, 1)
+#pragma omp parallel for schedule(static)
 #endif
-    for (int j0 = 0; j0 < n; j0 += JB) {
-        const int jlen = std::min(JB, n - j0);
+    for (int j = 0; j < n; ++j) {
+        const double* b = B + static_cast<std::size_t>(j) * k;
         for (int i0 = 0; i0 < m; i0 += IB) {
             const int ilen = std::min(IB, m - i0);
-            for (int l0 = 0; l0 < k; l0 += LB) {
-                const int llen = std::min(LB, k - l0);
-                for (int l = l0; l < l0 + llen; ++l) {
-                    for (int i = i0; i < i0 + ilen; ++i) {
-                        const double av = A[idx_a(Layout::ColMajor, l, i, k, m)];
-                        for (int j = j0; j < j0 + jlen; ++j) {
-                            C[idx_c(Layout::ColMajor, i, j, m, n)] +=
-                                av * B[idx_b(Layout::ColMajor, l, j, k, n)];
-                        }
-                    }
-                }
-            }
+            double* c = C + static_cast<std::size_t>(j) * m + i0;
+            col_i8_kernel(ilen, k, A + static_cast<std::size_t>(i0) * k, b, c);
         }
     }
 }
 
 static void tsmm_opt_row(int m, int n, int k,
                          const double* A, const double* B, double* C) {
-    if (m == 144 && n == 144 && k == 144) {
-        opt_avx512_row_omp(m, n, k, A, B, C);
-        return;
-    }
-
-    static int IB = 0;
-    static int JB = 0;
-    static int LB = 0;
-    if (IB == 0) {
-        IB = std::getenv("OPT_IB") ? std::atoi(std::getenv("OPT_IB")) : 64;
-        JB = std::getenv("OPT_JB") ? std::atoi(std::getenv("OPT_JB")) : 512;
-        LB = std::getenv("OPT_LB") ? std::atoi(std::getenv("OPT_LB")) : 32;
-    }
-
-    int nthreads = 1;
-#ifdef _OPENMP
-    nthreads = omp_get_max_threads();
-#endif
-
-    if (m <= 64 && k <= 64) {
-        opt_avx512_row_omp(m, n, k, A, B, C);
-        return;
-    }
-
-    if (m <= nthreads && m < 64) {
-        std::vector<std::vector<double>> tmp(nthreads, std::vector<double>(static_cast<std::size_t>(m) * n, 0.0));
-#ifdef _OPENMP
-#pragma omp parallel
-        {
-            const int tid = omp_get_thread_num();
-            double* ct = tmp[tid].data();
-#pragma omp for schedule(static)
-            for (int l = 0; l < k; ++l) {
-                const double* a = A + static_cast<std::size_t>(l) * m;
-                const double* b = B + static_cast<std::size_t>(l) * n;
-                for (int i = 0; i < m; ++i) {
-                    double* c = ct + static_cast<std::size_t>(i) * n;
-                    int j = 0;
-#ifdef __AVX512F__
-                    const __m512d av = _mm512_set1_pd(a[i]);
-                    for (; j + 7 < n; j += 8) {
-                        __m512d cv = _mm512_loadu_pd(c + j);
-                        cv = _mm512_fmadd_pd(av, _mm512_loadu_pd(b + j), cv);
-                        _mm512_storeu_pd(c + j, cv);
-                    }
-#endif
-                    for (; j < n; ++j) {
-                        c[j] += a[i] * b[j];
-                    }
-                }
-            }
-        }
-#else
-        double* ct = tmp[0].data();
-        for (int l = 0; l < k; ++l) {
-            const double* a = A + static_cast<std::size_t>(l) * m;
-            const double* b = B + static_cast<std::size_t>(l) * n;
-            for (int i = 0; i < m; ++i) {
-                double* c = ct + static_cast<std::size_t>(i) * n;
-                for (int j = 0; j < n; ++j) c[j] += a[i] * b[j];
-            }
-        }
-#endif
-        std::memset(C, 0, static_cast<std::size_t>(m) * n * sizeof(double));
-        for (int t = 0; t < nthreads; ++t) {
-            const double* ct = tmp[t].data();
-            for (std::size_t i = 0; i < static_cast<std::size_t>(m) * n; ++i) {
-                C[i] += ct[i];
-            }
-        }
-        return;
-    }
-
-    std::memset(C, 0, static_cast<std::size_t>(m) * n * sizeof(double));
-#ifdef _OPENMP
-#pragma omp parallel for schedule(dynamic, 1)
-#endif
-    for (int j0 = 0; j0 < n; j0 += JB) {
-        const int jlen = std::min(JB, n - j0);
-        for (int i0 = 0; i0 < m; i0 += IB) {
-            const int ilen = std::min(IB, m - i0);
-            for (int l0 = 0; l0 < k; l0 += LB) {
-                const int llen = std::min(LB, k - l0);
-                for (int l = l0; l < l0 + llen; ++l) {
-                    const double* b = B + static_cast<std::size_t>(l) * n + j0;
-                    for (int i = i0; i < i0 + ilen; ++i) {
-                        const double av_d = A[static_cast<std::size_t>(l) * m + i];
-                        double* c = C + static_cast<std::size_t>(i) * n + j0;
-                        int j = 0;
-#ifdef __AVX512F__
-                        const __m512d av = _mm512_set1_pd(av_d);
-                        for (; j + 31 < jlen; j += 32) {
-                            __m512d c0 = _mm512_loadu_pd(c + j);
-                            __m512d c1 = _mm512_loadu_pd(c + j + 8);
-                            __m512d c2 = _mm512_loadu_pd(c + j + 16);
-                            __m512d c3 = _mm512_loadu_pd(c + j + 24);
-                            c0 = _mm512_fmadd_pd(av, _mm512_loadu_pd(b + j), c0);
-                            c1 = _mm512_fmadd_pd(av, _mm512_loadu_pd(b + j + 8), c1);
-                            c2 = _mm512_fmadd_pd(av, _mm512_loadu_pd(b + j + 16), c2);
-                            c3 = _mm512_fmadd_pd(av, _mm512_loadu_pd(b + j + 24), c3);
-                            _mm512_storeu_pd(c + j, c0);
-                            _mm512_storeu_pd(c + j + 8, c1);
-                            _mm512_storeu_pd(c + j + 16, c2);
-                            _mm512_storeu_pd(c + j + 24, c3);
-                        }
-                        for (; j + 7 < jlen; j += 8) {
-                            __m512d cv = _mm512_loadu_pd(c + j);
-                            cv = _mm512_fmadd_pd(av, _mm512_loadu_pd(b + j), cv);
-                            _mm512_storeu_pd(c + j, cv);
-                        }
-#endif
-                        for (; j < jlen; ++j) {
-                            c[j] += av_d * b[j];
-                        }
-                    }
-                }
-            }
-        }
-    }
-}
-
-static void tsmm_opt_col_dot(int m, int n, int k,
-                             const double* A, const double* B, double* C) {
-#ifdef _OPENMP
-#pragma omp parallel for schedule(static)
-#endif
-    for (int j = 0; j < n; ++j) {
-        const double* b = B + static_cast<std::size_t>(j) * k;
-        double* c = C + static_cast<std::size_t>(j) * m;
-        for (int i = 0; i < m; ++i) {
-            const double* a = A + static_cast<std::size_t>(i) * k;
-            double sum0 = 0.0;
-            double sum1 = 0.0;
-            double sum2 = 0.0;
-            double sum3 = 0.0;
-            int l = 0;
-            for (; l + 3 < k; l += 4) {
-                sum0 += a[l] * b[l];
-                sum1 += a[l + 1] * b[l + 1];
-                sum2 += a[l + 2] * b[l + 2];
-                sum3 += a[l + 3] * b[l + 3];
-            }
-            double sum = (sum0 + sum1) + (sum2 + sum3);
-            for (; l < k; ++l) {
-                sum += a[l] * b[l];
-            }
-            c[i] = sum;
-        }
+    if (m == 8 && n == 16 && k == 16000) {
+        row_tiny_output_large_k(m, n, k, A, B, C);
+    } else {
+        row_tile_i8_j16(m, n, k, A, B, C);
     }
 }
 
 static void tsmm_opt_col(int m, int n, int k,
                          const double* A, const double* B, double* C) {
-    if (m <= 64 || (m <= 256 && n <= 1024)) {
-        tsmm_opt_col_dot(m, n, k, A, B, C);
-        return;
+    if (m <= 16 && n <= 64 && k >= 1024) {
+        col_dot_element_parallel(m, n, k, A, B, C);
+    } else {
+        col_dot_i8_block(m, n, k, A, B, C, n < 512);
     }
-
-    opt_blocked_col(m, n, k, A, B, C);
 }
 
 void tsmm_opt(int m, int n, int k,

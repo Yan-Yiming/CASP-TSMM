@@ -96,6 +96,7 @@ cd /path/to/CASP-TSMM
 
 ```bash
 module purge
+module load gcc/10.2.0
 module load intel/2022.1
 module load python/3.8.6
 ```
@@ -105,6 +106,14 @@ module load python/3.8.6
 ```bash
 make clean
 make CXX=icpc BLAS=mkl AVX512=1 -j16
+```
+
+这里加载 `gcc/10.2.0` 是为了给 `icpc` 提供匹配的 C++ 标准库。Makefile 也会在链接阶段显式补上 `-lstdc++`，避免出现 `std::__cxx11::basic_string` 或 `operator delete` 未定义的链接错误。
+
+`make clean` 默认只清理编译产物，不会删除 `web/results/` 下的历史结果。若确实需要清空历史结果和日志，使用：
+
+```bash
+make clean-results
 ```
 
 `-j16` 表示最多同时启动 16 个编译任务。登录节点上不建议直接使用不带数字的 `-j`，也不建议使用太大的并行数。
@@ -325,6 +334,16 @@ http://localhost:8080
 bash scripts/run_local.sh --required-only
 ```
 
+Dashboard 会扫描 `web/results/` 下所有历史 run。页面顶部的 `Run` 下拉框可以切换不同次测试，`Layout` 下拉框可以在 row-major 和 col-major 结果之间切换。
+
+每次 Slurm 或本地运行都会写入独立目录：
+
+```text
+web/results/<run-id>/
+```
+
+只要不执行 `make clean-results`，历史结果会一直保留。
+
 ## 添加新算子
 
 在 `src/tsmm/` 下新增一个 `.cpp` 文件，实现符合 `TsmmKernel` 签名的函数，然后注册：
@@ -357,6 +376,7 @@ MKLROOT is not set
 
 ```bash
 module purge
+module load gcc/10.2.0
 module load intel/2022.1
 module load python/3.8.6
 echo $MKLROOT

@@ -54,7 +54,7 @@ set -euo pipefail
 cd "\$SLURM_SUBMIT_DIR"
 mkdir -p logs web/results
 
-module load intel/2022.1 python/3.8.6 || true
+module load gcc/10.2.0 intel/2022.1 python/3.8.6 || true
 
 BENCHMARK_BIN="./obj/benchmark"
 if [ ! -x "\$BENCHMARK_BIN" ]; then

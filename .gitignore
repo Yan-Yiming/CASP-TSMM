@@ -12,3 +12,6 @@ web/results/
 web/gflops_*.csv
 web/gflops_*.json
 __pycache__/
+*.pdf
+optimization_report.md
+stage_report.md

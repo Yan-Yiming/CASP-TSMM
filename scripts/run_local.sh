@@ -47,7 +47,7 @@ BENCHMARK_BIN="${BENCHMARK_BIN:-./obj/benchmark}"
 
 WEB_PID=""
 if [ "$START_WEB" = "1" ]; then
-    python3 web/server.py --port 8080 --results "$RESULT_DIR" &
+    python3 web/server.py --port 8080 --results "$RESULT_ROOT" &
     WEB_PID=$!
     echo "Dashboard: http://localhost:8080"
 fi

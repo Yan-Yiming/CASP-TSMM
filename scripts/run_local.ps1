@@ -23,9 +23,6 @@ $sources = @(
     "src\reference.cpp",
     "src\tsmm_registry.cpp",
     "src\tsmm\naive.cpp",
-    "src\tsmm\openmp_kernel.cpp",
-    "src\tsmm\blocked.cpp",
-    "src\tsmm\avx512.cpp",
     "src\tsmm\opt.cpp"
 )
 

@@ -40,6 +40,21 @@
       z-index: 5;
     }
     h1 { font-size: 17px; margin: 0 10px 0 0; }
+    .controls {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      flex-wrap: wrap;
+    }
+    select {
+      color: var(--text);
+      background: var(--panel-2);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 4px 8px;
+      font: inherit;
+      max-width: 280px;
+    }
     main { padding: 18px 20px 28px; }
     .badge {
       border: 1px solid var(--border);
@@ -134,6 +149,10 @@
   <header>
     <span id="status-dot"></span>
     <h1>TSMM Benchmark Dashboard</h1>
+    <div class="controls">
+      <label>Run <select id="run-select"></select></label>
+      <label>Layout <select id="layout-select"></select></label>
+    </div>
     <span id="host" class="badge">Host: -</span>
     <span id="threads" class="badge info">Threads: -</span>
     <span id="layout" class="badge">Layout: -</span>
@@ -176,6 +195,9 @@
       opt: '#fb923c'
     };
     let chart = null;
+    let runs = [];
+    let selectedRun = '';
+    let selectedLayout = '';
 
     function colorFor(name) {
       return colors[name] || '#9aa7b7';
@@ -189,6 +211,58 @@
 
     function fmt(v, digits = 3) {
       return Number.isFinite(v) ? v.toFixed(digits) : '-';
+    }
+
+    function setSelectOptions(select, options, selected) {
+      select.innerHTML = '';
+      options.forEach(item => {
+        const option = document.createElement('option');
+        option.value = item.value;
+        option.textContent = item.label;
+        if (item.value === selected) option.selected = true;
+        select.appendChild(option);
+      });
+    }
+
+    async function loadRuns() {
+      const res = await fetch(`/api/runs?ts=${Date.now()}`);
+      const payload = await res.json();
+      runs = payload.runs || [];
+      if (!runs.length) {
+        selectedRun = '';
+        selectedLayout = '';
+        setSelectOptions(document.getElementById('run-select'), [], '');
+        setSelectOptions(document.getElementById('layout-select'), [], '');
+        return false;
+      }
+
+      if (!selectedRun || !runs.some(run => run.id === selectedRun)) {
+        selectedRun = runs[0].id;
+      }
+
+      const current = runs.find(run => run.id === selectedRun) || runs[0];
+      const layouts = current.layouts && current.layouts.length ? current.layouts : ['row', 'col'];
+      if (!selectedLayout || !layouts.includes(selectedLayout)) {
+        selectedLayout = layouts.includes('row') ? 'row' : layouts[0];
+      }
+
+      setSelectOptions(
+        document.getElementById('run-select'),
+        runs.map(run => ({
+          value: run.id,
+          label: `${run.id}  ${run.mtime_str || ''}`
+        })),
+        selectedRun
+      );
+      setSelectOptions(
+        document.getElementById('layout-select'),
+        layouts.map(layout => ({
+          value: layout,
+          label: layout === 'row' ? 'row-major' : 'col-major'
+        })),
+        selectedLayout
+      );
+      return true;
     }
 
     function renderInfo(data) {
@@ -287,7 +361,20 @@
 
     async function refresh() {
       try {
-        const res = await fetch(`/api/results?ts=${Date.now()}`);
+        const hasRuns = await loadRuns();
+        if (!hasRuns) {
+          document.getElementById('waiting').style.display = 'block';
+          document.getElementById('content').style.display = 'none';
+          document.getElementById('status-dot').className = '';
+          return;
+        }
+
+        const params = new URLSearchParams({
+          run: selectedRun,
+          layout: selectedLayout,
+          ts: Date.now().toString()
+        });
+        const res = await fetch(`/api/results?${params.toString()}`);
         const data = await res.json();
         if (data.status === 'waiting' || !data.problems) {
           document.getElementById('waiting').style.display = 'block';
@@ -303,12 +390,22 @@
         renderTables(data);
         const now = new Date().toLocaleTimeString('zh-CN');
         document.getElementById('updated').textContent = `Updated: ${now}`;
-        document.getElementById('footer').textContent = `Last refresh: ${now}. Polling every 3 seconds.`;
+        document.getElementById('footer').textContent = `Run: ${selectedRun}, layout: ${selectedLayout}. Last refresh: ${now}. Polling every 3 seconds.`;
       } catch (err) {
         document.getElementById('status-dot').className = '';
         console.warn(err);
       }
     }
+
+    document.getElementById('run-select').addEventListener('change', event => {
+      selectedRun = event.target.value;
+      selectedLayout = '';
+      refresh();
+    });
+    document.getElementById('layout-select').addEventListener('change', event => {
+      selectedLayout = event.target.value;
+      refresh();
+    });
 
     refresh();
     setInterval(refresh, 3000);
