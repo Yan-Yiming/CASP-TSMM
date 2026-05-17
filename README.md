@@ -1,141 +1,375 @@
 # CASP-TSMM
 
-Tall-Skinny Matrix Multiplication benchmark and optimization project.
+Tall-Skinny Matrix Multiplication (TSMM) 评测与优化项目。
 
-The project evaluates:
+本项目计算：
 
 ```text
 C = A^T * B
-A: k x m, B: k x n, C: m x n, double precision
+A: k x m
+B: k x n
+C: m x n
+数据类型: double
 ```
 
-Both row-major and column-major storage are supported by the benchmark. The local and Slurm runners execute both layouts for the four required tasks by default.
+评测程序同时支持行主序和列主序存储。默认运行 required 四组任务，并分别测试 row-major 和 col-major 两种布局。
 
-## Project Layout
+## 目标平台
+
+目标计算节点：
+
+```text
+CPU: Intel Xeon Platinum 9242
+核心数: 96
+NUMA 节点: 4
+指令集: AVX-512
+调度系统: Slurm
+```
+
+当前推荐流程是：
+
+```text
+登录节点编译 -> Slurm 提交 -> 计算节点运行
+```
+
+也就是说，`scripts/submit_slurm.sh` 不再负责编译，只负责申请计算节点资源、设置运行环境、执行 benchmark 并收集结果。
+
+## 目录结构
 
 ```text
 CASP-TSMM/
 |-- src/
-|   |-- benchmark.cpp       # benchmark harness, timing, correctness, JSON output
-|   |-- tsmm.hpp            # shared kernel interface and layout helpers
-|   |-- tsmm_registry.cpp   # automatic kernel registry
-|   |-- reference.cpp       # MKL/OpenBLAS dgemm reference, or built-in fallback
+|   |-- benchmark.cpp       # 评测入口、计时、正确性检查、JSON 输出
+|   |-- tsmm.hpp            # 算子接口、布局辅助函数
+|   |-- tsmm_registry.cpp   # 算子自动注册
+|   |-- reference.cpp       # MKL/OpenBLAS dgemm 参考实现，或内置 fallback
 |   `-- tsmm/
-|       |-- naive.cpp           # serial baseline
-|       |-- openmp_kernel.cpp   # OpenMP parallel baseline
-|       |-- blocked.cpp         # cache-blocked OpenMP kernel
-|       |-- avx512.cpp          # AVX-512 kernels
-|       `-- opt.cpp             # combined optimized kernel
+|       |-- naive.cpp           # 串行基线
+|       |-- openmp_kernel.cpp   # OpenMP 并行基线
+|       |-- blocked.cpp         # 分块 OpenMP 算子
+|       |-- avx512.cpp          # AVX-512 算子
+|       `-- opt.cpp             # 综合优化算子
 |-- scripts/
-|   |-- collect_gflops.py   # collect all GFLOPS rows into CSV/JSON
-|   |-- run_local.sh        # local row/col benchmark and dashboard runner
-|   |-- run_local.ps1       # Windows/MSVC local row/col runner
-|   `-- submit_slurm.sh     # Slurm submission helper for the target cluster
+|   |-- collect_gflops.py   # 汇总 GFLOPS 到 CSV/JSON
+|   |-- run_local.sh        # Linux 本地运行脚本
+|   |-- run_local.ps1       # Windows PowerShell 本地运行脚本
+|   `-- submit_slurm.sh     # Slurm 提交脚本，只运行，不编译
 |-- web/
-|   |-- index.html          # live dashboard
-|   `-- server.py           # lightweight Python server, no Docker
+|   |-- index.html          # 结果展示页面
+|   `-- server.py           # 轻量级本地 Web 服务，不需要 Docker
 `-- Makefile
 ```
 
-Generated files such as `benchmark`, `benchmark.exe`, `web/results/`, and `logs/` are not source files.
-Build intermediates and executables are placed under `obj/`.
+生成文件不属于源码，例如：
 
-## Implementations
+```text
+obj/
+web/results/
+logs/
+benchmark
+benchmark.exe
+```
 
-| Name | Description |
+## 算子版本
+
+| 名称 | 说明 |
 | --- | --- |
-| `reference` | CBLAS `dgemm` reference using MKL/OpenBLAS, or a built-in fallback with `BLAS=none` |
-| `naive` | serial three-loop TSMM |
-| `openmp` | OpenMP parallelization over rows of C |
-| `blocked` | cache-blocked OpenMP kernel, tunable with `TSMM_IB/JB/LB` |
-| `avx512` | row-major AVX-512 vectorized kernel |
-| `avx512_omp` | AVX-512 plus OpenMP |
-| `opt` | best-effort combined kernel with special handling for small `m` |
+| `reference` | 使用 MKL/OpenBLAS `dgemm` 的参考实现；`BLAS=none` 时使用内置 fallback |
+| `naive` | 串行三重循环 TSMM |
+| `openmp` | 基于 OpenMP 的并行版本 |
+| `blocked` | cache blocking + OpenMP 版本 |
+| `avx512` | AVX-512 向量化版本 |
+| `avx512_omp` | AVX-512 + OpenMP 版本 |
+| `opt` | 综合优化版本 |
 
-## Build And Run
+## 集群编译
+
+在登录节点进入项目目录：
 
 ```bash
-# One-key local run: required tasks, row-major and col-major
-bash scripts/run_local.sh --required-only
+cd /path/to/CASP-TSMM
+```
 
-# Optional: all tasks, row-major and col-major
+推荐使用 Intel 编译环境和 MKL：
+
+```bash
+module purge
+module load intel/2022.1
+module load python/3.8.6
+```
+
+编译：
+
+```bash
+make clean
+make CXX=icpc BLAS=mkl AVX512=1 -j16
+```
+
+`-j16` 表示最多同时启动 16 个编译任务。登录节点上不建议直接使用不带数字的 `-j`，也不建议使用太大的并行数。
+
+编译完成后检查：
+
+```bash
+ls -lh obj/benchmark
+```
+
+备用 OpenBLAS 编译方式：
+
+```bash
+module purge
+module load gcc/10.2.0
+module load openblas/0.3.17-ips18
+module load python/3.8.6
+
+make clean
+make BLAS=openblas AVX512=1 -j8
+```
+
+## 集群运行
+
+提交前必须已经存在可执行文件：
+
+```bash
+ls -lh obj/benchmark
+```
+
+提交 required 四组任务：
+
+```bash
+bash scripts/submit_slurm.sh
+```
+
+提交 required + optional 全部任务：
+
+```bash
+bash scripts/submit_slurm.sh --all
+```
+
+脚本默认申请：
+
+```text
+partition: 不默认指定，使用集群默认分区
+nodes: 1
+ntasks: 1
+cpus-per-task: 96
+memory: 64G
+time: 02:00:00
+NUMA nodes: 0-3
+```
+
+脚本会分别运行：
+
+```text
+--layout row
+--layout col
+```
+
+运行时使用：
+
+```text
+numactl --cpunodebind=0-3 --interleave=all
+OMP_NUM_THREADS=96
+OMP_PROC_BIND=spread
+OMP_PLACES=cores
+MKL_NUM_THREADS=96
+MKL_DYNAMIC=FALSE
+```
+
+如果需要覆盖 Slurm 参数，可以在命令前加环境变量：
+
+```bash
+sinfo
+PARTITION=实际分区名 CPUS_PER_TASK=96 MEM=64G TIME_LIMIT=02:00:00 bash scripts/submit_slurm.sh
+```
+
+如果 `sinfo` 显示存在默认分区，通常直接运行 `bash scripts/submit_slurm.sh` 即可，不需要设置 `PARTITION`。
+
+如果只想快速测试，可以把 benchmark 参数继续传给脚本，例如：
+
+```bash
+bash scripts/submit_slurm.sh --warmup 1 --runs 1
+```
+
+这些额外参数会传给 `obj/benchmark`。
+
+## 查看任务和结果
+
+提交后脚本会输出任务号，例如：
+
+```text
+Submitted job 324xxxxx
+Monitor: squeue -j 324xxxxx
+Log: tail -f logs/tsmm_324xxxxx.out
+```
+
+查看排队或运行状态：
+
+```bash
+squeue -j 324xxxxx
+```
+
+实时查看标准输出：
+
+```bash
+tail -f logs/tsmm_324xxxxx.out
+```
+
+如果任务失败，查看错误日志：
+
+```bash
+cat logs/tsmm_324xxxxx.err
+```
+
+每次运行的结果目录为：
+
+```text
+web/results/<job_id>_<timestamp>/
+```
+
+重点查看：
+
+```bash
+cat web/results/<run-id>/gflops.csv
+cat web/results/<run-id>/gflops_summary.json
+```
+
+其中：
+
+```text
+gflops.csv           # 每个任务、每个算子的 GFLOPS 和加速比
+gflops_summary.json  # 汇总结果，包括几何平均加速比
+results_row_*.json   # row-major 原始结果
+results_col_*.json   # col-major 原始结果
+```
+
+## Benchmark 参数
+
+`obj/benchmark` 支持：
+
+```text
+--required-only       只运行 required 四组问题
+--all                 运行 required + optional 全部问题
+--layout row|col      指定 row-major 或 col-major
+--output-dir DIR      输出结果到目录，文件名自动带 layout 和时间戳
+--output PATH         指定完整输出文件路径
+--warmup N            预热次数，默认 10
+--runs N              正式计时次数，默认 20
+--no-correctness      跳过和 reference 的正确性对比
+```
+
+大规模任务会自动限制预热和正式计时次数，避免运行时间过长。
+
+手动 smoke test 示例：
+
+```bash
+./obj/benchmark --required-only --layout row --warmup 1 --runs 1
+```
+
+正式性能测试建议使用 Slurm 脚本，而不是在登录节点直接运行。
+
+## 本地运行
+
+Linux 本地快速运行：
+
+```bash
+bash scripts/run_local.sh --required-only
+```
+
+运行全部任务：
+
+```bash
 bash scripts/run_local.sh --all
 ```
 
-On this Windows workspace, use the PowerShell runner:
+Windows PowerShell：
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File scripts/run_local.ps1
 ```
 
+不依赖 BLAS 的功能测试：
+
 ```bash
-# Manual smoke test. If --output is omitted, the file name includes layout and timestamp.
 make BLAS=none
 ./obj/benchmark --required-only --layout row --warmup 1 --runs 1
 ```
 
-Benchmark options:
+## Web 展示
 
-```text
---required-only       run only the four required problems
---all                 run required and optional problems
---layout row|col      choose row-major or column-major storage
---output-dir DIR      write results_<layout>_<timestamp>.json into DIR
---output PATH         explicit output path, bypassing timestamp naming
---warmup N            warmup iterations, default 10
---runs N              timed iterations, default 20
---no-correctness      skip comparison with the reference result
-```
-
-For very large problems the harness automatically caps warmup to 3 and timed runs to 5 to keep evaluation practical.
-
-## Dashboard
+启动本地结果页面：
 
 ```bash
 make web
-# open http://localhost:8080
 ```
 
-Or run benchmark and dashboard together:
+然后打开：
+
+```text
+http://localhost:8080
+```
+
+也可以直接用本地运行脚本生成结果并启动页面：
 
 ```bash
 bash scripts/run_local.sh --required-only
 ```
 
-Each run writes timestamped JSON files under `web/results/<run-id>/`, plus `gflops.csv` and `gflops_summary.json`. The dashboard reads the newest result file it can find.
+## 添加新算子
 
-## Adding A Kernel
-
-Add a new `.cpp` file under `src/tsmm/`, implement a function matching `TsmmKernel`, then register it:
+在 `src/tsmm/` 下新增一个 `.cpp` 文件，实现符合 `TsmmKernel` 签名的函数，然后注册：
 
 ```cpp
 #include "../tsmm.hpp"
 
-void tsmm_my_kernel(int m, int n, int k, const double* A, const double* B, double* C, Layout layout) {
+void tsmm_my_kernel(int m, int n, int k,
+                    const double* A,
+                    const double* B,
+                    double* C,
+                    Layout layout) {
     // compute C = A^T * B
 }
 
 REGISTER_TSMM_IMPL("my_kernel", tsmm_my_kernel);
 ```
 
-The Makefile compiles `src/tsmm/*.cpp`, and the benchmark discovers registered kernels automatically.
+Makefile 会自动编译 `src/tsmm/*.cpp`，benchmark 会自动发现注册的算子。
 
-## Slurm Target Run
+## 常见问题
 
-The target CPU is Intel Xeon Platinum 9242 with 96 cores, 4 NUMA nodes, and AVX-512. The submission helper requests all 96 CPUs and runs both row-major and col-major required tasks by default:
+如果编译时报：
 
-```bash
-bash scripts/submit_slurm.sh              # required problems
-bash scripts/submit_slurm.sh --all        # required + optional
-bash scripts/submit_slurm.sh --dry-run    # print the generated job script
+```text
+MKLROOT is not set
 ```
 
-The job uses `numactl --cpunodebind=0-3 --interleave=all`, `OMP_PROC_BIND=spread`, and `OMP_PLACES=cores`. Because the benchmark initializes matrices serially, interleaving pages across all four NUMA nodes is the most robust placement without changing measurement code; it avoids putting all pages on one NUMA node before the 96 OpenMP threads start computing.
-
-Useful environment overrides:
+说明 MKL 环境没有加载好。优先尝试：
 
 ```bash
-PARTITION=cpu CPUS_PER_TASK=96 NUMA_NODES=0-3 BLAS=mkl bash scripts/submit_slurm.sh
+module purge
+module load intel/2022.1
+module load python/3.8.6
+echo $MKLROOT
 ```
 
-The final metric is GFLOPS per task and speedup versus the `reference` `dgemm` baseline. The dashboard also reports the geometric mean speedup across the required problems.
+如果仍然为空，尝试：
+
+```bash
+module purge
+module load oneAPI/2022.1
+module load python/3.8.6
+echo $MKLROOT
+```
+
+如果提交后报：
+
+```text
+Missing executable: ./obj/benchmark
+```
+
+说明提交前还没有编译，先执行：
+
+```bash
+make CXX=icpc BLAS=mkl AVX512=1 -j8
+```
+
+如果运行时报 MKL 动态库找不到，确认提交脚本里加载了和编译时一致的 Intel/oneAPI 模块。

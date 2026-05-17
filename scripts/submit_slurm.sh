@@ -3,12 +3,16 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
-PARTITION="${SLURM_PARTITION:-cpu}"
+PARTITION="${PARTITION:-${SLURM_PARTITION:-}}"
 CPUS_PER_TASK="${CPUS_PER_TASK:-96}"
 NUMA_NODES="${NUMA_NODES:-0-3}"
 TIME_LIMIT="${TIME_LIMIT:-02:00:00}"
 MEM="${MEM:-64G}"
 BLAS="${BLAS:-mkl}"
+PARTITION_DIRECTIVE=""
+if [ -n "$PARTITION" ]; then
+    PARTITION_DIRECTIVE="#SBATCH --partition=$PARTITION"
+fi
 
 ALL_PROBLEMS=false
 DRY_RUN=false
@@ -29,12 +33,15 @@ else
     MODE_ARGS="--all"
 fi
 
-EXTRA_ARGS_TEXT="${EXTRA_ARGS[*]}"
+EXTRA_ARGS_TEXT=""
+if [ "${#EXTRA_ARGS[@]}" -gt 0 ]; then
+    EXTRA_ARGS_TEXT="${EXTRA_ARGS[*]}"
+fi
 
 JOBSCRIPT=$(cat <<EOF
 #!/usr/bin/env bash
 #SBATCH --job-name=tsmm_bench
-#SBATCH --partition=$PARTITION
+$PARTITION_DIRECTIVE
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=$CPUS_PER_TASK
@@ -47,10 +54,16 @@ set -euo pipefail
 cd "\$SLURM_SUBMIT_DIR"
 mkdir -p logs web/results
 
-module load intel/2020 mkl/2020 gcc/10 || true
+module load intel/2022.1 python/3.8.6 || true
 
-make BLAS=$BLAS AVX512=1 -j$CPUS_PER_TASK
 BENCHMARK_BIN="./obj/benchmark"
+if [ ! -x "\$BENCHMARK_BIN" ]; then
+    echo "Missing executable: \$BENCHMARK_BIN" >&2
+    echo "Compile before submitting, for example:" >&2
+    echo "  make BLAS=$BLAS AVX512=1 -j$CPUS_PER_TASK" >&2
+    exit 1
+fi
+echo "Using existing \$BENCHMARK_BIN"
 
 export OMP_NUM_THREADS=$CPUS_PER_TASK
 export OMP_PROC_BIND=spread
@@ -74,13 +87,10 @@ numactl --hardware || true
 
 for layout in row col; do
     echo "=== Running layout: \$layout ==="
-    numactl --cpunodebind=$NUMA_NODES --interleave=all \\
-        "\$BENCHMARK_BIN" --output-dir "\$RESULT_DIR" $MODE_ARGS --layout "\$layout" $EXTRA_ARGS_TEXT
+    numactl --cpunodebind=$NUMA_NODES --interleave=all "\$BENCHMARK_BIN" --output-dir "\$RESULT_DIR" $MODE_ARGS --layout "\$layout" $EXTRA_ARGS_TEXT
 done
 
-python3 scripts/collect_gflops.py "\$RESULT_DIR" \\
-    --csv "\$RESULT_DIR/gflops.csv" \\
-    --json "\$RESULT_DIR/gflops_summary.json"
+python3 scripts/collect_gflops.py "\$RESULT_DIR" --csv "\$RESULT_DIR/gflops.csv" --json "\$RESULT_DIR/gflops_summary.json"
 
 echo "Result dir: \$RESULT_DIR"
 echo "GFLOPS CSV: \$RESULT_DIR/gflops.csv"
