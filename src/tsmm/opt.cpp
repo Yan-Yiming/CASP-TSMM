@@ -468,11 +468,8 @@ static void col_4000_16000_128_pack_a(const double* A, const double* B, double* 
         }
     }
 
-    // Keep a whole group of B columns on one thread.  The old collapse(2)
-    // schedule split (j0,i0) pairs across threads, which reloaded the same
-    // 8x128 B panel for every i-block and created finer scheduling work.
 #ifdef _OPENMP
-#pragma omp parallel for schedule(static)
+#pragma omp parallel for collapse(2) schedule(static)
 #endif
     for (int j0 = 0; j0 < N; j0 += JB) {
         for (int i0 = 0; i0 < M; i0 += IB) {
