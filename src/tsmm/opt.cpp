@@ -468,8 +468,11 @@ static void col_4000_16000_128_pack_a(const double* A, const double* B, double* 
         }
     }
 
+    // Keep a whole group of B columns on one thread.  The old collapse(2)
+    // schedule split (j0,i0) pairs across threads, which reloaded the same
+    // 8x128 B panel for every i-block and created finer scheduling work.
 #ifdef _OPENMP
-#pragma omp parallel for collapse(2) schedule(static)
+#pragma omp parallel for schedule(static)
 #endif
     for (int j0 = 0; j0 < N; j0 += JB) {
         for (int i0 = 0; i0 < M; i0 += IB) {
@@ -502,6 +505,8 @@ static void col_4000_16000_128_pack_a(const double* A, const double* B, double* 
 }
 
 // Col-major 32x16000x16: A fits in L1 after transposition, then each B column is cheap.
+// The four-column AVX-512 path is deliberately unrolled to reduce loop and
+// indexed-register overhead on this small-k case.
 static void col_32_16000_16_multi_col(const double* A, const double* B, double* C) {
     constexpr int M = 32;
     constexpr int N = 16000;
@@ -520,33 +525,71 @@ static void col_32_16000_16_multi_col(const double* A, const double* B, double* 
 #endif
     for (int j0 = 0; j0 < N; j0 += JB) {
 #ifdef __AVX512F__
-        __m512d acc[JB][4];
-        for (int x = 0; x < JB; ++x) {
-            for (int v = 0; v < 4; ++v) {
-                acc[x][v] = _mm512_setzero_pd();
-            }
-        }
+        __m512d c00 = _mm512_setzero_pd();
+        __m512d c01 = _mm512_setzero_pd();
+        __m512d c02 = _mm512_setzero_pd();
+        __m512d c03 = _mm512_setzero_pd();
+        __m512d c10 = _mm512_setzero_pd();
+        __m512d c11 = _mm512_setzero_pd();
+        __m512d c12 = _mm512_setzero_pd();
+        __m512d c13 = _mm512_setzero_pd();
+        __m512d c20 = _mm512_setzero_pd();
+        __m512d c21 = _mm512_setzero_pd();
+        __m512d c22 = _mm512_setzero_pd();
+        __m512d c23 = _mm512_setzero_pd();
+        __m512d c30 = _mm512_setzero_pd();
+        __m512d c31 = _mm512_setzero_pd();
+        __m512d c32 = _mm512_setzero_pd();
+        __m512d c33 = _mm512_setzero_pd();
+
         for (int l = 0; l < K; ++l) {
             const __m512d a0 = _mm512_load_pd(at[l]);
             const __m512d a1 = _mm512_load_pd(at[l] + 8);
             const __m512d a2 = _mm512_load_pd(at[l] + 16);
             const __m512d a3 = _mm512_load_pd(at[l] + 24);
             const double* b = B + static_cast<std::size_t>(j0) * K + l;
-            for (int x = 0; x < JB; ++x) {
-                const __m512d bv = _mm512_set1_pd(b[x * K]);
-                acc[x][0] = _mm512_fmadd_pd(bv, a0, acc[x][0]);
-                acc[x][1] = _mm512_fmadd_pd(bv, a1, acc[x][1]);
-                acc[x][2] = _mm512_fmadd_pd(bv, a2, acc[x][2]);
-                acc[x][3] = _mm512_fmadd_pd(bv, a3, acc[x][3]);
-            }
+            const __m512d b0 = _mm512_set1_pd(b[0 * K]);
+            const __m512d b1 = _mm512_set1_pd(b[1 * K]);
+            const __m512d b2 = _mm512_set1_pd(b[2 * K]);
+            const __m512d b3 = _mm512_set1_pd(b[3 * K]);
+            c00 = _mm512_fmadd_pd(b0, a0, c00);
+            c01 = _mm512_fmadd_pd(b0, a1, c01);
+            c02 = _mm512_fmadd_pd(b0, a2, c02);
+            c03 = _mm512_fmadd_pd(b0, a3, c03);
+            c10 = _mm512_fmadd_pd(b1, a0, c10);
+            c11 = _mm512_fmadd_pd(b1, a1, c11);
+            c12 = _mm512_fmadd_pd(b1, a2, c12);
+            c13 = _mm512_fmadd_pd(b1, a3, c13);
+            c20 = _mm512_fmadd_pd(b2, a0, c20);
+            c21 = _mm512_fmadd_pd(b2, a1, c21);
+            c22 = _mm512_fmadd_pd(b2, a2, c22);
+            c23 = _mm512_fmadd_pd(b2, a3, c23);
+            c30 = _mm512_fmadd_pd(b3, a0, c30);
+            c31 = _mm512_fmadd_pd(b3, a1, c31);
+            c32 = _mm512_fmadd_pd(b3, a2, c32);
+            c33 = _mm512_fmadd_pd(b3, a3, c33);
         }
-        for (int x = 0; x < JB; ++x) {
-            double* c = C + static_cast<std::size_t>(j0 + x) * M;
-            _mm512_store_pd(c, acc[x][0]);
-            _mm512_store_pd(c + 8, acc[x][1]);
-            _mm512_store_pd(c + 16, acc[x][2]);
-            _mm512_store_pd(c + 24, acc[x][3]);
-        }
+
+        double* c = C + static_cast<std::size_t>(j0) * M;
+        _mm512_store_pd(c, c00);
+        _mm512_store_pd(c + 8, c01);
+        _mm512_store_pd(c + 16, c02);
+        _mm512_store_pd(c + 24, c03);
+        c += M;
+        _mm512_store_pd(c, c10);
+        _mm512_store_pd(c + 8, c11);
+        _mm512_store_pd(c + 16, c12);
+        _mm512_store_pd(c + 24, c13);
+        c += M;
+        _mm512_store_pd(c, c20);
+        _mm512_store_pd(c + 8, c21);
+        _mm512_store_pd(c + 16, c22);
+        _mm512_store_pd(c + 24, c23);
+        c += M;
+        _mm512_store_pd(c, c30);
+        _mm512_store_pd(c + 8, c31);
+        _mm512_store_pd(c + 16, c32);
+        _mm512_store_pd(c + 24, c33);
 #else
         for (int x = 0; x < JB; ++x) {
             const double* b = B + static_cast<std::size_t>(j0 + x) * K;
