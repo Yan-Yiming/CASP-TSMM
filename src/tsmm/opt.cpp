@@ -443,10 +443,7 @@ static void col_dot_i8_block(int m, int n, int k,
 }
 
 // Col-major large-output kernel for 4000x16000x128.
-// Packing A changes repeated strided loads into unit-stride loads inside the
-// j-block loop.  This experiment keeps the proven collapse(2) scheduling and
-// uses regular stores for C; on the target CPU non-temporal stores were not
-// guaranteed to help this shape.
+// Packing A changes repeated strided loads into unit-stride loads inside the j-block loop.
 static void col_4000_16000_128_pack_a(const double* A, const double* B, double* C) {
 #ifndef __AVX512F__
     col_dot_i8_block(4000, 16000, 128, A, B, C, false);
@@ -495,11 +492,12 @@ static void col_4000_16000_128_pack_a(const double* A, const double* B, double* 
             }
             for (int x = 0; x < JB; ++x) {
                 double* c = C + static_cast<std::size_t>(j0 + x) * M + i0;
-                _mm512_storeu_pd(c, lo[x]);
-                _mm512_storeu_pd(c + 8, hi[x]);
+                _mm512_stream_pd(c, lo[x]);
+                _mm512_stream_pd(c + 8, hi[x]);
             }
         }
     }
+    _mm_sfence();
 #endif
 }
 
