@@ -1,0 +1,221 @@
+TSMM 性能优化工作计划
+更新时间：2026-06-18
+
+一、定位
+
+当前仓库已经有完整的评测框架、MKL/OpenBLAS 参考实现、Slurm 运行脚本和 Web 结果展示页面。后续工作的重点不再是“搭框架”，而是把当前初级版 opt.cpp 作为 baseline，在目标机器 Intel Xeon Platinum 9242 上做性能优化。
+
+目标是：
+
+1. required 四组问题在 row-major 和 col-major 下都正确。
+2. 以 MKL dgemm 为 reference，记录每组 GFLOPS 和 speedup。
+3. 优化 opt 算子，使 required 四组的几何平均 speedup 尽可能高。
+4. 每次优化都保留独立实验记录，避免只凭单次波动判断。
+
+二、性能优化总路线
+
+1. 先建立目标机 baseline
+   - 用 MKL + AVX-512 编译当前初级 opt.cpp。
+   - 通过 Slurm 在 96 核、4 NUMA node 上运行 required row/col。
+   - 保存 gflops.csv、gflops_summary.json、logs/tsmm_<job_id>.out。
+   - 按问题规模、layout、speedup 排序，找出拖累 geomean 的项。
+
+2. 再按规模做特化
+   - TSMM 的四组 required 形状差异很大，一个通用 kernel 很难同时最优。
+   - 后续 opt.cpp 应按 (m,n,k,layout) 分派到专门 kernel。
+   - 每个 kernel 的核心目标不同：
+     - 大输出矩阵：减少 C 写带宽压力，提高流式写入效率。
+     - 小输出大 k：提高 k 维并行和归约效率。
+     - 小 k 大 n：减少循环开销，提高 j 方向并行和向量吞吐。
+     - 小矩阵：控制线程数，避免 OpenMP 调度开销超过计算收益。
+
+3. 每轮优化都用数据驱动
+   - 每次只改一个主要策略，例如 block size、线程数、是否 packing、是否 streaming store。
+   - 每轮至少跑 required row/col。
+   - 记录：
+     - 编译器和编译参数。
+     - OMP/MKL/NUMA 环境变量。
+     - 每个 problem/layout 的 reference GFLOPS、opt GFLOPS、speedup。
+     - required geomean speedup。
+   - 如果某个策略只提升单项但明显拖累 geomean，需要回滚或做条件分派。
+
+三、待办列表
+
+高优先级
+
+- [ ] 建立性能日志 work_log.md，格式固定为：时间、改动、编译命令、运行命令、结果摘要、结论、下一步。
+- [ ] 在目标机器编译当前 baseline：
+      module purge
+      module load gcc/10.2.0
+      module load intel/2022.1
+      module load python/3.8.6
+      make clean
+      make CXX=icpc BLAS=mkl AVX512=1 -j16
+- [ ] 提交 required baseline：
+      bash scripts/submit_slurm.sh
+- [ ] 从 baseline 结果中整理性能表：
+      problem, layout, reference_time_ms, opt_time_ms, reference_GFLOPS, opt_GFLOPS, speedup, correct
+- [ ] 找出 geomean 中最差的 2 个 required 项，优先优化它们。
+
+中优先级
+
+- [x] 为每个 required 规模建立单独优化入口，不再只依赖通用 row_tile_i8_j16 / col_dot_i8_block。
+- [x] 在 src/tsmm/opt.cpp 中保留清晰分派逻辑：
+      if layout=row and m/n/k match -> specialized row kernel
+      if layout=col and m/n/k match -> specialized col kernel
+      otherwise -> generic fallback
+- [ ] 将 ref.cpp 中的思路拆解成实验项，只参考策略，不直接照搬函数名、结构和代码风格。
+- [x] 对每个特化 kernel 添加简短注释：适用规模、分块参数、并行维度、预期瓶颈。
+- [ ] 每次修改后先跑小 runs 正确性，再跑正式 warmup=10、runs=20。
+
+四、按问题规模的优化计划
+
+1. (4000,16000,128)
+
+特点：
+ - 输出 C 有 6400 万个 double，约 512 MB。
+ - FLOPs 约 16.384 GFLOP。
+ - C 写入和 B 流式读取压力大，线程/NUMA 分布很关键。
+
+row-major 优化方向：
+ - j 方向连续，适合按 j-block 做 AVX-512 向量化。
+ - 实验 IB/JB：
+   - IB=4, JB=40
+   - IB=6, JB=24
+   - IB=8, JB=16/32
+   - IB=10, JB=16
+ - 测试 OpenMP 分配方式：
+   - collapse(2) schedule(static)
+   - j-group 外层并行，减少不同线程写相邻 C 行导致的带宽冲突。
+ - 测试 _mm512_stream_pd：
+   - C 基本只写一次，non-temporal store 可能减少 cache 污染。
+   - 必须实测，因为 streaming store 对小块或未对齐尾部可能变慢。
+
+col-major 优化方向：
+ - A 的每个 i 在 k 维连续，但计算大规模 C 时会重复访问 A。
+ - B 的每个 j 在 k 维连续，适合一次处理多个 j。
+ - 实验 A packing：
+   - 把 A 从 col-major 的 A[i*k+l] pack 成 Apack[l*m+i]。
+   - 用 Apack 连续加载 8/16 个 i。
+ - 实验 JB=8/12/16 列同时处理，IB=8/16。
+ - C 按列连续写，适合 streaming store。
+
+2. (8,16,16000)
+
+特点：
+ - 输出只有 128 个 double。
+ - k 很大，计算量约 4.096 MFLOP。
+ - 96 线程全开可能调度和归约开销过大。
+
+优化方向：
+ - 不走通用 tile。
+ - 沿 k 维切分，每个线程计算 partial[8][16]。
+ - 最后做小规模归约。
+ - 固定线程数实验：
+   - 4 threads
+   - 8 threads
+   - 16 threads
+   - 24 threads
+ - 比较两种实现：
+   - OpenMP parallel num_threads(N)
+   - 手动按 omp_get_thread_num 分配 k range。
+ - 目标是减少线程启动、内存写 partial、最终归约的开销。
+
+3. (32,16000,16)
+
+特点：
+ - k 很小，n 很大。
+ - 输出约 512k double，约 4 MB。
+ - 计算强度不高，循环开销和并行粒度很重要。
+
+row-major 优化方向：
+ - j 连续，适合宽 j-block。
+ - 实验：
+   - IB=2, JB=64
+   - IB=4, JB=32/64
+   - IB=8, JB=16/32
+ - k=16 可完全展开或用编译器 unroll。
+ - 线程数实验：
+   - 24
+   - 48
+   - 96
+ - 如果 96 线程变慢，按该规模固定较少线程。
+
+col-major 优化方向：
+ - A 很小，可以转置/pack 到 aligned buffer。
+ - B 每列 16 个 double 连续。
+ - C 每列 32 个 double 连续。
+ - 实验一次处理 4/8/10 个 B 列，使用 AVX-512 同时输出 32 个 i。
+ - 线程沿 j 方向并行，减少 collapse 造成的调度碎片。
+
+4. (144,144,144)
+
+特点：
+ - 总计算量约 5.97 MFLOP。
+ - 数据量小，线程过多通常会拖慢。
+ - 需要控制 OpenMP 开销。
+
+row-major 优化方向：
+ - 实验 IB=8/9/12，JB=16/24/32。
+ - 测试 num_threads=16/24/32/48。
+ - 优先减少调度开销，避免 96 线程过度切分。
+
+col-major 优化方向：
+ - j 方向外层并行。
+ - 每次处理 1/2/4 个列向量 B。
+ - 每个 i-block 使用 AVX-512 对 k 做 dot product。
+ - 同样测试较少线程数。
+
+五、实现阶段安排
+
+阶段 1：基线与瓶颈确认
+
+- [ ] 目标机跑当前 opt baseline。
+- [ ] 统计 row/col 各 4 组 required 的 speedup。
+- [ ] 记录最差项和最优项，判断当前实现主要问题是写带宽、线程开销、访存跨步还是缺少特化。
+
+阶段 2：row-major 特化
+
+- [x] 优先优化 (4000,16000,128) row-major。
+- [x] 优先优化 (32,16000,16) row-major。
+- [x] 增加 (8,16,16000) row-major 的 k-parallel kernel。
+- [x] 为 (144,144,144) row-major 限制线程数并测试小矩阵 block。
+
+阶段 3：col-major 特化
+
+- [x] 为 (4000,16000,128) col-major 增加 A packing + j-block kernel。
+- [x] 为 (32,16000,16) col-major 增加小 A pack + 多列并行 kernel。
+- [x] 为 (144,144,144) col-major 测试 2 列/4 列 dot kernel。
+- [ ] 为 (8,16,16000) col-major 复用或改写 k-parallel partial kernel。
+
+阶段 4：线程和 NUMA 调优
+
+- [ ] 对每个特化 kernel 测试 24/48/96 线程。
+- [ ] 比较 OMP_PROC_BIND=spread 和 close。
+- [ ] 比较 KMP_AFFINITY=compact 与 scatter/spread。
+- [ ] 保持 Slurm numactl --cpunodebind=0-3 --interleave=all，必要时测试按 socket 分块写 C。
+
+阶段 5：整合提交版
+
+- [ ] 只保留稳定提升 geomean 的 kernel。
+- [ ] 删除明显失败的实验代码，或移入单独候选文件不注册。
+- [ ] 保持 opt 为默认提交算子。
+- [ ] README 中补充最终优化策略、运行命令和结果解释。
+
+六、评估标准
+
+每轮优化后用以下标准判断是否保留：
+
+1. correctness 必须为 OK。
+2. required geomean speedup 提升优先级最高。
+3. 如果单项提升但 geomean 下降，默认不合入主 opt。
+4. 如果 row-major 提升但 col-major 下降，必须用 layout 条件分派隔离。
+5. 如果只在少量 runs 中偶然提升，需要重复运行确认。
+6. 小矩阵不追求 96 线程满载，追求实际 wall time 最短。
+
+七、近期下一步
+
+1. 先跑当前初级 opt 的目标机 baseline。
+2. 把结果反馈到 work_log.md。
+3. 根据最差 required 项，优先做第一个特化 kernel。
+4. 第一轮建议从 (4000,16000,128) 和 (32,16000,16) 开始，因为它们对 geomean 和总体性能影响最大。
